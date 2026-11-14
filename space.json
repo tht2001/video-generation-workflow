@@ -1,0 +1,8 @@
+{
+  "runtime": "typescript",
+  "platformVersion": 28,
+  "entry": "client/dist/index.html",
+  "name": "视频生成工作流",
+  "slug": "shi-pin-sheng-cheng-gong-zuo-liu",
+  "managedCronJobs": []
+}

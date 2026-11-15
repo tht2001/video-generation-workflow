@@ -378,21 +378,28 @@ async function reconcileShotStates(ctx: Ctx, projectId: number): Promise<void> {
   }
 }
 
-// ------------------------------------------- consistency hard gate (step 4)
+// ------------------------------------------- consistency gate (step 4)
 //
-// The user's zero-tolerance rule: a shot's people — foreground AND
-// background, even half-visible — must match the bound characters' look
-// anchors (gender, face, hair, costume). "done" (video saved) is not
-// enough: sampled frames of the actual footage are vision-checked against
-// every bound character's anchor image and hard-written features. A failed
-// check regenerates the shot automatically (bounded); a shot that still
-// fails stays out of the stitch until it is regenerated and passes the
-// hard gate. There is NO manual exemption: passing the gate is the only
-// way into the stitch.
+// Sampled frames of a saved shot are vision-checked against the bound
+// characters' look anchors. How strict that check is follows the project's
+// acceptance mode (projects.qa_mode, user-approved relaxation 2026-11-14):
+// - "loose" (default): only three hard story errors fail a shot — the
+//   wrong character performing the lead action, a key plot action
+//   wrong/missing, or a required key character absent for the whole shot.
+//   Everything else (text printed on clothes, badge size/shape, extra
+//   background people, half a person at the frame edge, blurry background
+//   faces, ponytail height, body shape, collar color…) is recorded on the
+//   card as a warning and never blocks the stitch.
+// - "strict": the original zero-tolerance rule — every visible person,
+//   foreground AND background, must match the anchors exactly.
+// A failed check regenerates the shot automatically (bounded); a shot that
+// still fails stays out of the stitch until it passes OR the user manually
+// approves it (approveShot — 人工放行, qa_approved = 1, qa_status = passed).
 
 const MAX_QA_ATTEMPTS = 2;
 
-/** Ready for stitching: video saved AND hard gate passed. No exceptions. */
+/** Ready for stitching: video saved AND accepted (frame check passed in
+ *  the project's mode, or manually approved). */
 function shotReady(s: ShotRow): boolean {
   return s.genStatus === "done" && Boolean(s.videoBlobKey) && s.qaStatus === "passed";
 }
@@ -442,6 +449,7 @@ const projectOut = z.object({
   publishTitle: z.string(),
   publishCopy: z.string(),
   publishConfirmed: z.boolean(),
+  qaMode: z.string(),
   updatedAt: z.string(),
 });
 
@@ -468,6 +476,7 @@ const shotOut = z.object({
   qaCheckedAt: z.string().nullable(),
   qaAttempts: z.number(),
   qaMaxAttempts: z.number(),
+  qaApproved: z.boolean(),
   ready: z.boolean(),
 });
 
@@ -532,6 +541,7 @@ function serializeProject(p: ProjectRow, finalUrl: string | null) {
     publishTitle: p.publishTitle,
     publishCopy: p.publishCopy,
     publishConfirmed: p.publishConfirmed === 1,
+    qaMode: p.qaMode,
     updatedAt: p.updatedAt.toISOString(),
   };
 }
@@ -653,6 +663,7 @@ export const Actions = {
           qaCheckedAt: s.qaCheckedAt ? s.qaCheckedAt.toISOString() : null,
           qaAttempts: s.qaAttempts,
           qaMaxAttempts: MAX_QA_ATTEMPTS,
+          qaApproved: s.qaApproved === 1,
           ready: shotReady(s),
         });
       }
@@ -730,13 +741,14 @@ export const Actions = {
       audience: z.string().max(200).optional(),
       platform: z.string().max(40).optional(),
       tone: z.string().max(200).optional(),
+      qaMode: z.enum(["loose", "strict"]).optional(),
       currentStep: z.number().int().min(1).max(6).optional(),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
       const d = db(ctx);
       const values: Record<string, unknown> = { updatedAt: now() };
-      for (const key of ["title", "topic", "videoType", "aspect", "targetDuration", "audience", "platform", "tone", "currentStep"] as const) {
+      for (const key of ["title", "topic", "videoType", "aspect", "targetDuration", "audience", "platform", "tone", "qaMode", "currentStep"] as const) {
         if (args[key] !== undefined) values[key] = args[key];
       }
       await d.update(schema.projects).set(values).where(eq(schema.projects.id, args.projectId));
@@ -804,6 +816,7 @@ export const Actions = {
         values.qaModel = "";
         values.qaCheckedAt = null;
         values.qaAttempts = 0;
+        values.qaApproved = 0;
         values.verifyExempt = 0;
       }
       if (args.characterIds !== undefined) {
@@ -821,6 +834,63 @@ export const Actions = {
       }
       await d.update(schema.shots).set(values).where(eq(schema.shots.id, args.shotId));
       if (contentChanged) await invalidatePairs(ctx, shot.projectId, [args.shotId]);
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  approveShot: defineAction({
+    description: "人工放行一镜：把已有视频的镜头直接标记为验收通过（qa_status=passed 并备注人工放行及原因），可立即进拼接，不再等抽帧验收。用户在卡片上点「人工放行」或由代理调用。",
+    request: z.object({
+      shotId: z.number(),
+      reason: z.string().max(500).optional(),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const d = db(ctx);
+      const rows = await d.select().from(schema.shots).where(eq(schema.shots.id, args.shotId));
+      const shot = rows[0];
+      if (!shot) throw new Error("分镜不存在。");
+      if (!shot.videoBlobKey) throw new Error("这一镜还没有生成出视频，没有可放行的成片。");
+      if (shotReady(shot)) return { ok: true as const };
+      const reason = (args.reason ?? "").trim();
+      await d
+        .update(schema.shots)
+        .set({
+          genStatus: "done",
+          failReason: null,
+          quotaExceeded: 0,
+          qaStatus: "passed",
+          qaApproved: 1,
+          qaReason: reason ? `人工放行：${reason}` : "人工放行（未填写原因）",
+          qaModel: "人工放行",
+          qaCheckedAt: now(),
+          updatedAt: now(),
+        })
+        .where(eq(schema.shots.id, shot.id));
+      await touchProject(ctx, shot.projectId);
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  resetShotQuota: defineAction({
+    description: "清除一镜的「额度用完」标记与失败原因：当额度标记是陈旧误报（例如成片只是验收没过、额度其实还有）把镜头永久锁死时调用，清掉后可重新生成这一镜。不动视频、验收状态等其他数据。",
+    request: z.object({
+      shotId: z.number(),
+    }),
+    response: okResponse,
+    async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
+      const d = db(ctx);
+      const rows = await d.select().from(schema.shots).where(eq(schema.shots.id, args.shotId));
+      const shot = rows[0];
+      if (!shot) throw new Error("分镜不存在。");
+      if (shot.quotaExceeded !== 1) return { ok: true as const };
+      await d
+        .update(schema.shots)
+        .set({ quotaExceeded: 0, failReason: null, updatedAt: now() })
+        .where(eq(schema.shots.id, shot.id));
+      await touchProject(ctx, shot.projectId);
       ctx.invalidateQueries();
       return { ok: true as const };
     },
@@ -1066,7 +1136,7 @@ export const Actions = {
   }),
 
   startJob: defineAction({
-    description: "启动一个后台任务（生成脚本、拆分镜、提取角色、补描述、生成定妆图、连续性检查、一键修复、生成视频、单镜人物一致性硬验、拼接成片、整理发布文案）。视频生成后必须过抽帧硬验（逐人比对定妆锚图，含背景人物），不过自动重生成，未通过不许拼接。立即返回任务 id，进度靠 advanceJob 分步推进；同类任务在跑时不会重复启动。",
+    description: "启动一个后台任务（生成脚本、拆分镜、提取角色、补描述、生成定妆图、连续性检查、一键修复、生成视频、单镜抽帧验收、拼接成片、整理发布文案）。视频生成后按项目验收模式（宽松/严格）抽帧验收，不过自动重生成；未通过验收的镜头不能拼接，但用户可人工放行。立即返回任务 id，进度靠 advanceJob 分步推进；同类任务在跑时不会重复启动。",
     request: z.object({
       projectId: z.number(),
       kind: z.enum([
@@ -1231,7 +1301,7 @@ export const Actions = {
         const shot = shots.find((s) => s.id === args.shotId);
         if (!shot) throw new Error("分镜不存在。");
         if (shotReady(shot)) {
-          throw new Error("这一镜已经生成完成并通过人物一致性硬验，不会重复生成。");
+          throw new Error("这一镜已经生成完成并通过验收，不会重复生成。");
         }
         if (shot.quotaExceeded === 1) throw new Error("这一镜上次失败是因为视频生成额度用完，请等额度恢复后再重试，不要反复点击。");
         if (shot.genStatus === "done" && shot.videoBlobKey) {
@@ -1240,7 +1310,7 @@ export const Actions = {
           // budget. (Footage still awaiting its first check is NOT
           // discarded — verify_shot checks it as-is.)
           if (shot.qaStatus !== "failed") {
-            throw new Error("这一镜的视频已生成、正在等待抽帧硬验，不需要重新生成；硬验不通过时工作流会自动重生成。");
+            throw new Error("这一镜的视频已生成、正在等待抽帧验收，不需要重新生成；验收不通过时工作流会自动重生成。");
           }
           await ctx.blobs.delete(shot.videoBlobKey).catch(() => undefined);
           await d
@@ -1253,6 +1323,7 @@ export const Actions = {
               qaReason: "",
               qaAttempts: 0,
               verifyExempt: 0,
+              qaApproved: 0,
               updatedAt: now(),
             })
             .where(eq(schema.shots.id, shot.id));
@@ -1268,9 +1339,9 @@ export const Actions = {
         const shots = await loadShots(ctx, args.projectId);
         const shot = shots.find((s) => s.id === args.shotId);
         if (!shot) throw new Error("分镜不存在。");
-        if (shot.genStatus !== "done" || !shot.videoBlobKey) throw new Error("这一镜还没有生成出视频，先生成视频再硬验。");
-        if (shotReady(shot)) throw new Error("这一镜已经通过人物一致性硬验，不需要重复硬验。");
-        const jobId = await createJob(ctx, args.projectId, kind, { shotId: shot.id }, `正在抽帧硬验第 ${shot.seq} 镜的人物一致性…`, 1);
+        if (shot.genStatus !== "done" || !shot.videoBlobKey) throw new Error("这一镜还没有生成出视频，先生成视频再验收。");
+        if (shotReady(shot)) throw new Error("这一镜已经通过验收，不需要重复验收。");
+        const jobId = await createJob(ctx, args.projectId, kind, { shotId: shot.id }, `正在抽帧验收第 ${shot.seq} 镜…`, 1);
         ctx.invalidateQueries();
         return { jobId, alreadyRunning: false };
       }
@@ -1278,7 +1349,7 @@ export const Actions = {
       if (kind === "gen_all_videos") {
         const shots = await loadShots(ctx, args.projectId);
         const targets = shots.filter((s) => !shotReady(s));
-        if (targets.length === 0) throw new Error("所有分镜都已生成完成并通过人物一致性硬验。");
+        if (targets.length === 0) throw new Error("所有分镜都已生成完成并通过验收。");
         const jobId = await createJob(
           ctx,
           args.projectId,
@@ -1305,7 +1376,7 @@ export const Actions = {
         { finalKeyBefore: project.finalBlobKey ?? "" },
         missing.length === 0
           ? "正在拼接成片（保留原声、烧录字幕）…"
-          : `还有 ${missing.length} 镜未就绪（第 ${missing.map((s) => s.seq).join("、")} 镜）：未生成的先补生成，已生成但未过人物一致性硬验的先复验/重生成，全部通过硬验后自动拼接…`,
+          : `还有 ${missing.length} 镜未就绪（第 ${missing.map((s) => s.seq).join("、")} 镜）：未生成的先补生成，已生成但未过验收的先复验/重生成，全部通过验收后自动拼接…`,
         shots.length,
       );
       // No agent task is spawned for stitching: the job is driven by
@@ -1367,7 +1438,7 @@ export const Actions = {
             status: "done",
             progressDone: 1,
             progressTotal: 1,
-            message: "这一镜的视频已经保存好并通过人物一致性硬验，无需重新生成。",
+            message: "这一镜的视频已经保存好并通过验收，无需重新生成。",
           });
           ctx.invalidateQueries();
           return { jobId: newId };
@@ -1383,14 +1454,14 @@ export const Actions = {
             job.projectId,
             "verify_shot",
             { shotId: detail.shotId },
-            "重试中：正在重新抽帧硬验人物一致性…",
+            "重试中：正在重新抽帧验收…",
             1,
           );
           await patchJob(ctx, newId, {
             status: "done",
             progressDone: 1,
             progressTotal: 1,
-            message: "已转为硬验重试：只重新抽帧核对，不重新生成视频。",
+            message: "已转为验收重试：只重新抽帧核对，不重新生成视频。",
           });
           ctx.invalidateQueries();
           return { jobId: verifyId };
@@ -1409,6 +1480,7 @@ export const Actions = {
               qaReason: "",
               qaAttempts: 0,
               verifyExempt: 0,
+              qaApproved: 0,
               quotaExceeded: 0,
               updatedAt: now(),
             })
@@ -1520,7 +1592,7 @@ export const Actions = {
         if (args.phase === "finish") {
           const fresh = (await loadShots(ctx, job.projectId)).find((s) => s.id === shotId);
           if (fresh && shotReady(fresh)) {
-            await patchJob(ctx, job.id, { status: "done", progressDone: 1, progressTotal: 1, message: "视频生成完成，人物一致性硬验已通过" });
+            await patchJob(ctx, job.id, { status: "done", progressDone: 1, progressTotal: 1, message: "视频生成完成，已通过验收" });
             ctx.invalidateQueries();
             return { ok: true, instruction: "任务完成。", payload: {} };
           }
@@ -1529,12 +1601,12 @@ export const Actions = {
             // passed yet. Keep the job running: the workflow's polling
             // driver runs the frame check next and regenerates the shot
             // automatically if it fails. The spawned task is done either way.
-            await patchJob(ctx, job.id, { message: "原片已收片，正在抽帧硬验人物一致性（不通过会自动重生成）…" });
+            await patchJob(ctx, job.id, { message: "原片已收片，正在抽帧验收（不通过会自动重生成）…" });
             ctx.invalidateQueries();
             return {
               ok: true,
               instruction:
-                "收片完成，本任务到此结束：人物一致性硬验由工作流自动进行，不通过会自动重新生成这一镜，你不需要再做任何事。",
+                "收片完成，本任务到此结束：抽帧验收由工作流按项目验收模式自动进行，不通过会自动重新生成这一镜，你不需要再做任何事。",
               payload: {},
             };
           }
@@ -1548,7 +1620,7 @@ export const Actions = {
         return {
           ok: true,
           instruction:
-            "按 payload 生成这一镜的真视频，人物一致性是硬门禁，必须严格执行 payload.hardRules：把 payload.characters 里每一个角色（包括只在背景出现的人物）的定妆图都作为参考图带入生成，并把每个人的性别、外貌、发型与服装特征逐字写进生成提示词锁死；画面里不允许出现名单之外的任何人物。承接上一镜结尾状态；台词由画面人物开口说出并做口型同步，旁白才用画外音；必须有环境音/背景音乐；不要烧字幕。生成后先 jobStep(generated) 再 saveShotVideo 收片。注意：收片后工作流会抽帧硬验——逐帧比对每个出镜人物（含背景人物）与定妆锚图，不通过会自动作废并重新生成这一镜，所以务必按锚图与写死特征生成。",
+            "按 payload 生成这一镜的真视频，人物一致性是硬门禁，必须严格执行 payload.hardRules：把 payload.characters 里每一个角色（包括只在背景出现的人物）的定妆图都作为参考图带入生成，并把每个人的性别、外貌、发型与服装特征逐字写进生成提示词锁死；画面里不允许出现名单之外的任何人物。承接上一镜结尾状态；台词由画面人物开口说出并做口型同步，旁白才用画外音；必须有环境音/背景音乐；不要烧字幕。生成后先 jobStep(generated) 再 saveShotVideo 收片。注意：收片后工作流会按项目验收模式抽帧验收（宽松模式只拦主角认错人、关键剧情动作错缺、关键角色缺席三类硬伤；严格模式逐人比对定妆锚图），所以务必按锚图与写死特征生成，主角与关键剧情动作尤其不能错。",
           payload: {
             shotId: shot.id,
             seq: shot.seq,
@@ -1575,7 +1647,9 @@ export const Actions = {
               "全员锚图：characters 中每个角色的定妆图都要作为参考图传入生成——包括只在背景、远景出现的人物，背景人物同样锁脸、锁性别、锁服装。",
               "特征写死：把每个角色 mustMatch 中的性别、外貌、发型、服装颜色与款式逐字写进生成提示词，不允许改性别、换脸、换发型、换衣服颜色或款式。",
               "名单外零人物：画面中不得出现 characters 名单之外的任何人物——背景、远景、路人、只露半张脸或半个身子的人都不行；原脚本若提到未绑定的背景人物，一律不生成该人物。",
-              "硬验门禁：收片后工作流会从成片中抽帧，逐人（含背景人物）与定妆锚图和写死特征比对；任何一个人对不上（性别/脸/发型/服装）整镜判不过、自动作废重生成。",
+              project?.qaMode === "strict"
+                ? "验收门禁（严格模式）：收片后工作流会从成片中抽帧，逐人（含背景人物）与定妆锚图和写死特征比对；任何一个人对不上（性别/脸/发型/服装）整镜判不过、自动作废重生成。"
+                : "验收门禁（宽松模式）：收片后工作流会从成片中抽帧验收，只拦三类硬伤——做动作的主角认错了人、关键剧情动作错了或缺了、本镜必需的关键角色全程没出镜；其余细节（衣服文字、徽章、背景多人、脸糊等）只记提醒、不拦通过。所以主角是谁、关键动作与关键道具内容务必做对。",
             ],
             lookImageHelp:
               "定妆图文件在磁盘上的定位：对 imageBlobKey 计算 sha256，文件位于 ~/workspace/ts-spaces/shi-pin-sheng-cheng-gong-zuo-liu/blobs/objects/<sha256 前 2 位>/<完整 sha256>；若不存在，再试 blobs/objects/<imageBlobKey 原文>。把找到的全部定妆图作为参考图传给视频生成。",
@@ -1657,6 +1731,7 @@ export const Actions = {
           qaModel: "",
           qaCheckedAt: null,
           verifyExempt: 0,
+          qaApproved: 0,
           updatedAt: now(),
         })
         .where(eq(schema.shots.id, shot.id));
@@ -1664,11 +1739,11 @@ export const Actions = {
         // Do NOT finish the job here: the job's driver runs the hard gate
         // next (frame check, automatic regeneration on failure) and only
         // completes once the shot is actually ready.
-        await patchJob(ctx, job.id, { message: "原片已收片，正在抽帧硬验人物一致性（不通过会自动重生成）…" });
+        await patchJob(ctx, job.id, { message: "原片已收片，正在抽帧验收（不通过会自动重生成）…" });
       }
       await touchProject(ctx, shot.projectId);
       ctx.invalidateQueries();
-      return { ok: true, message: `第 ${shot.seq} 镜收片完成，接下来自动抽帧硬验人物一致性（不通过会自动重生成）。` };
+      return { ok: true, message: `第 ${shot.seq} 镜收片完成，接下来自动按项目验收模式抽帧验收（不通过会自动重生成）。` };
     },
   }),
 
@@ -1696,7 +1771,7 @@ export const Actions = {
         const notPassed = missing.filter((s) => s.genStatus === "done" && s.videoBlobKey);
         const parts: string[] = [];
         if (notGenerated.length > 0) parts.push(`${notGenerated.length} 镜未生成完成（第 ${notGenerated.map((s) => s.seq).join("、")} 镜）`);
-        if (notPassed.length > 0) parts.push(`${notPassed.length} 镜未通过人物一致性硬验（第 ${notPassed.map((s) => s.seq).join("、")} 镜），硬验通过前不能拼接`);
+        if (notPassed.length > 0) parts.push(`${notPassed.length} 镜未通过验收（第 ${notPassed.map((s) => s.seq).join("、")} 镜），通过验收或人工放行后才能拼接`);
         throw new Error(`无法拼接：${parts.join("；")}。`);
       }
       const outcome = await pollStitch(ctx, job, project, shots);
@@ -1779,7 +1854,7 @@ const d = db(ctx);
 const existing = await d.select().from(schema.shots).where(eq(schema.shots.id, shotId));
 const shotNow = existing[0];
 if (shotNow && shotReady(shotNow)) {
-await patchJob(ctx, jobId, { status: "done", progressDone: 1, progressTotal: 1, message: "视频生成完成，人物一致性硬验已通过"});
+await patchJob(ctx, jobId, { status: "done", progressDone: 1, progressTotal: 1, message: "视频生成完成，已通过验收"});
 return;
 }
 if (shotNow?.videoBlobKey && shotNow.genStatus === "done") {
@@ -1795,7 +1870,7 @@ await d
 const message = [
 `你负责为「视频生成工作流」（artifact slug：shi-pin-sheng-cheng-gong-zuo-liu）中的一个分镜生成真视频并回写结果。本任务最多生成 1 条视频。`,
 `第一步：调用 artifact 动作 jobStep，参数 {"jobId": ${jobId}, "phase": "claim"}，返回的 payload 是这一镜的完整生成要求。`,
-`第二步：按 payload 用你的视频生成能力生成这一镜的真视频（不要用图片动效冒充）。人物一致性是硬门禁，严格执行 payload.hardRules：按 payload.lookImageHelp 找到 payload.characters 中每一个角色的定妆图（含只在背景出现的人物）全部作为参考图传入；把每个角色 mustMatch 里的性别、外貌、发型、服装特征逐字写进生成提示词锁死；画面里绝不出现名单之外的任何人物（背景、远景、只露半边的人也不行）。开场承接 payload.prevEndState；台词由画面人物开口说出、嘴型明显同步，旁白才用画外音；必须有环境音/背景音乐；画面里不要烧字幕。收片后工作流会抽帧逐人硬验（含背景人物），对不上就作废重生成，所以务必按锚图与写死特征生成。`,
+`第二步：按 payload 用你的视频生成能力生成这一镜的真视频（不要用图片动效冒充）。人物一致性是硬门禁，严格执行 payload.hardRules：按 payload.lookImageHelp 找到 payload.characters 中每一个角色的定妆图（含只在背景出现的人物）全部作为参考图传入；把每个角色 mustMatch 里的性别、外貌、发型、服装特征逐字写进生成提示词锁死；画面里绝不出现名单之外的任何人物（背景、远景、只露半边的人也不行）。开场承接 payload.prevEndState；台词由画面人物开口说出、嘴型明显同步，旁白才用画外音；必须有环境音/背景音乐；画面里不要烧字幕。收片后工作流会按项目验收模式抽帧验收，所以务必按锚图与写死特征生成，主角和关键剧情动作尤其不能错。`,
 `第三步：生成成功拿到视频文件本地路径后，先调用 jobStep {"jobId": ${jobId}, "phase": "generated", "sourcePath": "<本地路径>", "durationSec": <实际时长>}，再调用 artifact 动作 saveShotVideo {"shotId": <payload.shotId>, "jobId": ${jobId}, "sourcePath": "<同一路径>"} 完成收片。`,
 `如果生成失败：调用 jobStep {"jobId": ${jobId}, "phase": "fail", "error": "<具体失败原因>"}；若原因是视频生成额度用完，在参数里加 "quotaExceeded": true 且 error 中写明额度已用完。`,
 `不要处理其他镜头，不要新建任何项目或测试内容。`,
@@ -1840,20 +1915,29 @@ await patchJob(ctx, job.id, { status: "failed", error: "生成任务多次卡住
 }
 
 /**
- * The hard gate itself: sample frames from the shot's saved video and
- * vision-check EVERY person visible in them — foreground, background,
- * distant, half-visible — against the bound characters' look-anchor images
- * and hard-written features (gender, face, hair, costume). Throws on
- * infrastructure failure (no frames extractable, model error); a "fail"
- * verdict is data, not an exception.
+ * The consistency gate itself: sample frames from the shot's saved video
+ * and vision-check them against the bound characters' look-anchor images
+ * and hard-written features. The project's acceptance mode decides what
+ * counts as a failure:
+ * - "strict": EVERY person visible — foreground, background, distant,
+ *   half-visible — must match an anchor exactly; anything unverifiable
+ *   fails.
+ * - "loose" (default): only three hard story errors fail (wrong lead
+ *   actor, key plot action wrong/missing, required key character absent
+ *   for the whole shot); everything else comes back as a warning that is
+ *   recorded on the card but never blocks the stitch.
+ * Throws on infrastructure failure (no frames extractable, model error);
+ * a "fail" verdict is data, not an exception.
  */
 async function verifyShotConsistency(
 ctx: Ctx,
 projectId: number,
 shot: ShotRow,
 level: "full" | "light" = "full",
-): Promise<{ verdict: "pass" | "fail"; reason: string; mode: string }> {
-if (!shot.videoBlobKey) throw new Error(`第 ${shot.seq} 镜还没有视频文件，无法硬验。`);
+): Promise<{ verdict: "pass" | "fail"; reason: string; warnings: string[]; mode: string }> {
+const project = await loadProject(ctx, projectId);
+const qaMode = project?.qaMode === "strict" ? "strict" : "loose";
+if (!shot.videoBlobKey) throw new Error(`第 ${shot.seq} 镜还没有视频文件，无法验收。`);
 const chars = await loadCharacters(ctx, projectId);
 const bound = chars.filter((c) => parseIds(shot.characterIds).includes(c.id));
 const framesRes = await ctx.executePrivileged(privileged.extractFrames, {
@@ -1862,7 +1946,7 @@ blobKey: shot.videoBlobKey,
 count: level === "full" ? 4 : 3,
 });
 if (framesRes.frames.length === 0) {
-throw new Error(`第 ${shot.seq} 镜抽帧失败：没能从视频里抽出任何画面，无法进行人物一致性硬验，请稍后重试硬验。`);
+throw new Error(`第 ${shot.seq} 镜抽帧失败：没能从视频里抽出任何画面，无法进行抽帧验收，请稍后重试验收。`);
 }
 const images: { dataBase64: string; mimeType: "image/jpeg" | "image/png"; caption?: string }[] = [];
 framesRes.frames.forEach((f, i) => {
@@ -1895,30 +1979,57 @@ anchorNotes.push(`角色「${c.name}」的定妆锚图读取失败，只能按�
 }
 const castText = bound.length
 ? bound.map((c) => `- ${c.name}：性别与外貌特征「${c.appearance || "（未填）"}」；服装「${c.costume || "（未填）"}」`).join("\n")
-: "（本镜没有绑定任何出场人物，应当是空镜/场景镜，画面里不应出现任何人物）";
+: "（本镜没有绑定任何出场人物，应当是空镜/场景镜）";
+const strictRules = [
+`你是一名极其严格的短剧人物一致性验收员。先给你这一镜成片的抽帧图（共 ${framesRes.frames.length} 张），随后是每个出场角色的定妆锚图。这是零容忍硬验：有一处对不上就判 fail。`,
+`验收规则（任一条不满足即判 fail）：\n1. 逐张抽帧图检查画面里出现的每一个人——包括背景里的人、远处的人、只露半张脸或半个身子的人，一个都不能漏查。\n2. 画面里出现的每个人都必须能在名单里找到对应角色，且性别、面孔、发型、体型与服装颜色/款式都与该角色的定妆锚图和文字特征一致。出现名单之外的任何人物（哪怕只在背景一闪而过，或性别、服装对不上任何角色），判 fail。\n3. 按画面描述本应在本镜可见的角色，若在所有抽帧图里都找不到，或找到了但性别/脸/发型/服装明显对不上，判 fail。\n4. 名单为空（空镜）时，画面里出现任何人物都判 fail。\n5. 只判人物一致性，不评演技、画质与构图；某个人看不清、无法确认是否对得上时，按对不上处理（fail）并在 issues 里写明是哪一帧、哪个人。`,
+`summary 用一句话写结论；issues 逐条列出发现的问题（通过时给空数组）；warnings 给空数组。`,
+];
+const looseRules = [
+`你是一名短剧成片验收员，按「宽松验收」标准核对这一镜。先给你这一镜成片的抽帧图（共 ${framesRes.frames.length} 张），随后是每个出场角色的定妆锚图。宽松验收只看剧情对不对，不抠画面细节。`,
+`只有以下三类硬伤才判 fail（写进 issues）：\n1. 做动作的主角认错了人：画面描述里执行关键动作、推动剧情的那个角色，被另一个角色顶替了（例如该男孩起身离席、结果是寸头男站起来），或主角明显是另一个人。\n2. 关键剧情动作错了或缺了：画面描述/中文提示词里的核心动作没有发生、做错了，或关键道具内容不对（例如饭盒没打开、打开了里面没有该有的包子蔬菜鸡蛋）。\n3. 该镜必需的关键角色全程没出镜：画面描述明确要求出场的主要角色，在所有抽帧图里都找不到。`,
+`以下问题一律只记为提醒（写进 warnings），绝不影响 verdict：衣服上印了文字、徽章大小或形状不对、背景多出名单外的学生或路人、画面边缘露出半个人、背景人物脸模糊看不清、马尾扎得高一点低一点、人物体型胖一点瘦一点、领口颜色或款式细节对不上、背景人物性别或服装细节存疑。看不清的背景人物同样只记提醒，不要因为看不清就判 fail。`,
+`名单为空（空镜）时，画面里出现任何人物只记提醒，不判 fail。\nsummary 用一句话写结论；issues 只列三类硬伤（没有就给空数组，verdict 相应为 pass）；warnings 逐条列出提醒类问题（没有就给空数组）。`,
+];
 const out = await ctx.inference.complete(
 [
-`你是一名极其严格的短剧人物一致性验收员。先给你这一镜成片的抽帧图（共 ${framesRes.frames.length} 张），随后是每个出场角色的定妆锚图。这是零容忍硬验：有一处对不上就判 fail。`,
+...(qaMode === "strict" ? strictRules.slice(0, 1) : looseRules.slice(0, 1)),
 `本镜：第 ${shot.seq} 镜《${shot.title}》\n画面描述：${shot.visual}\n中文提示词：${shot.promptZh}\n台词/旁白：${shot.dialogue || "（无）"}\n开场状态：${shot.startState}\n结尾状态：${shot.endState}`,
 `本镜应当出现的全部人物（包括只在背景出现的人物）及写死的定妆特征：\n${castText}${anchorNotes.length ? `\n备注：${anchorNotes.join("；")}` : ""}`,
-`验收规则（任一条不满足即判 fail）：\n1. 逐张抽帧图检查画面里出现的每一个人——包括背景里的人、远处的人、只露半张脸或半个身子的人，一个都不能漏查。\n2. 画面里出现的每个人都必须能在名单里找到对应角色，且性别、面孔、发型、体型与服装颜色/款式都与该角色的定妆锚图和文字特征一致。出现名单之外的任何人物（哪怕只在背景一闪而过，或性别、服装对不上任何角色），判 fail。\n3. 按画面描述本应在本镜可见的角色，若在所有抽帧图里都找不到，或找到了但性别/脸/发型/服装明显对不上，判 fail。\n4. 名单为空（空镜）时，画面里出现任何人物都判 fail。\n5. 只判人物一致性，不评演技、画质与构图；某个人看不清、无法确认是否对得上时，按对不上处理（fail）并在 issues 里写明是哪一帧、哪个人。`,
-`summary 用一句话写结论；issues 逐条列出发现的问题（通过时给空数组）。`,
+...(qaMode === "strict" ? strictRules.slice(1) : looseRules.slice(1)),
 ].join("\n\n"),
 {
 schema: z.object({
 verdict: z.enum(["pass", "fail"]),
 summary: z.string(),
 issues: z.array(z.string()),
+warnings: z.array(z.string()),
 }),
 images,
 timeout_secs: 180,
 },
 );
-const reason = [out.summary, ...out.issues].filter((s) => s.trim()).join("；").slice(0, 900);
+const hardIssues = out.issues.filter((s) => s.trim());
+// In loose mode the verdict is recomputed from the hard issues alone, so
+// a model that still flags detail problems as "fail" cannot block a shot
+// the user only wants story-checked.
+const verdict: "pass" | "fail" = qaMode === "loose" ? (hardIssues.length > 0 ? "fail" : "pass") : out.verdict;
+const warnings = (qaMode === "loose" ? out.warnings : []).filter((s) => s.trim());
+const reasonParts = [out.summary, ...(verdict === "fail" ? hardIssues : [])].filter((s) => s.trim());
+const reason = reasonParts.join("；").slice(0, 900);
 return {
-verdict: out.verdict,
-reason: reason || (out.verdict === "pass" ? "抽帧硬验通过：出场人物（含背景人物）与定妆锚一致。" : "抽帧硬验未通过。"),
-mode: level === "full" ? "Muse 视觉硬验" : "Muse 视觉硬验（轻量复核）",
+verdict,
+reason:
+reason ||
+(verdict === "pass"
+? qaMode === "loose"
+? "宽松验收通过：主角、关键剧情动作与必需角色都对得上。"
+: "抽帧硬验通过：出场人物（含背景人物）与定妆锚一致。"
+: "验收未通过。"),
+warnings,
+mode:
+(qaMode === "loose" ? "Muse 视觉验收（宽松）" : "Muse 视觉硬验（严格）") +
+(level === "light" ? " · 轻量复核" : ""),
 };
 }
 
@@ -1954,16 +2065,29 @@ genStatus: "pending",
 failReason: null,
 qaStatus: "pending",
 qaAttempts: attempt,
+qaApproved: 0,
 updatedAt: now(),
 })
 .where(eq(schema.shots.id, shot.id));
 await patchJob(ctx, job.id, {
-message: `第 ${shot.seq} 镜人物一致性硬验未通过（${shot.qaReason.slice(0, 200)}），已作废该片，正在自动重新生成（第 ${attempt} / ${MAX_QA_ATTEMPTS} 次）…`,
+message: `第 ${shot.seq} 镜验收未通过（${shot.qaReason.slice(0, 200)}），已作废该片，正在自动重新生成（第 ${attempt} / ${MAX_QA_ATTEMPTS} 次）…`,
 });
-await spawnVideoTask(ctx, projectId, shot.id, job.id, attempt);
+// The regeneration MUST be dispatched under a brand-new gen_video job:
+// jobStep's claim/generated write-backs only accept gen_video jobs, so
+// reusing this job's id breaks whenever the current job is a verify_shot
+// (its spawned agent can never claim the work — the jobs 70/71/82/83 bug).
+const childId = await createJob(
+ctx,
+projectId,
+"gen_video",
+{ shotId: shot.id, parentJobId: job.id },
+`正在重新生成第 ${shot.seq} 镜的真视频…`,
+1,
+);
+await spawnVideoTask(ctx, projectId, shot.id, childId, attempt);
 return "busy";
 }
-const failReason = `人物一致性硬验未通过（已自动重生成 ${MAX_QA_ATTEMPTS} 次仍未通过）：${shot.qaReason}。请在画布卡片上重新生成这一镜，硬验通过后才能拼接。`;
+const failReason = `验收未通过（已自动重生成 ${MAX_QA_ATTEMPTS} 次仍未通过）：${shot.qaReason}。可以在画布卡片上重新生成这一镜，或点「人工放行」直接采用当前成片进拼接。`;
 await d
 .update(schema.shots)
 .set({ genStatus: "failed", failReason, updatedAt: now() })
@@ -1974,7 +2098,7 @@ await d
 .update(schema.shots)
 .set({ qaStatus: "checking", updatedAt: now() })
 .where(eq(schema.shots.id, shot.id));
-await patchJob(ctx, job.id, { message: `正在抽帧硬验第 ${shot.seq} 镜的人物一致性（逐人比对定妆锚图，含背景人物）…` });
+await patchJob(ctx, job.id, { message: `正在抽帧验收第 ${shot.seq} 镜（按项目验收模式核对）…` });
 let res: Awaited<ReturnType<typeof verifyShotConsistency>>;
 try {
 res = await verifyShotConsistency(ctx, projectId, shot, "full");
@@ -1985,14 +2109,20 @@ res = await verifyShotConsistency(ctx, projectId, shot, "full");
 // fails the job with its real reason.
 const msg = e instanceof Error ? e.message : String(e);
 if (!/timed out|timeout/i.test(msg)) throw e;
-await patchJob(ctx, job.id, { message: `第 ${shot.seq} 镜硬验完整核对超时，正在以轻量模式（3 帧 + 文字特征）复核…` });
+await patchJob(ctx, job.id, { message: `第 ${shot.seq} 镜验收完整核对超时，正在以轻量模式（3 帧 + 文字特征）复核…` });
 res = await verifyShotConsistency(ctx, projectId, shot, "light");
 }
+// Loose-mode warnings ride along in qa_reason so the card shows them;
+// they never affect the verdict.
+const storedReason =
+res.verdict === "pass" && res.warnings.length > 0
+? `${res.reason}｜提醒（不影响通过）：${res.warnings.join("；")}`.slice(0, 900)
+: res.reason;
 await d
 .update(schema.shots)
 .set({
 qaStatus: res.verdict === "pass" ? "passed" : "failed",
-qaReason: res.reason,
+qaReason: storedReason,
 qaModel: res.mode,
 qaCheckedAt: now(),
 updatedAt: now(),
@@ -2001,8 +2131,8 @@ updatedAt: now(),
 await patchJob(ctx, job.id, {
 message:
 res.verdict === "pass"
-? `第 ${shot.seq} 镜抽帧硬验通过：出场人物（含背景人物）与定妆锚一致。`
-: `第 ${shot.seq} 镜抽帧硬验未通过：${res.reason.slice(0, 300)}`,
+? `第 ${shot.seq} 镜验收通过${res.warnings.length > 0 ? `（有 ${res.warnings.length} 条提醒，已记在卡片上，不影响拼接）` : ""}。`
+: `第 ${shot.seq} 镜验收未通过：${res.reason.slice(0, 300)}`,
 });
 return res.verdict === "pass" ? "ready" : "busy";
 }
@@ -2705,7 +2835,7 @@ else gateQueue.push(s);
 let gateSpawned = 0;
 for (const s of gateQueue) {
 if (gateActive + gateSpawned >= 4) break;
-await createJob(ctx, projectId, "verify_shot", { shotId: s.id, parentJobId: job.id}, `正在抽帧硬验第 ${s.seq} 镜的人物一致性…`, 1);
+await createJob(ctx, projectId, "verify_shot", { shotId: s.id, parentJobId: job.id}, `正在抽帧验收第 ${s.seq} 镜…`, 1);
 gateSpawned++;
 }
 const readyCount = targets.filter((s) => shotReady(s)).length;
@@ -2716,16 +2846,42 @@ const gatePending = gateShots.length;
 await patchJob(ctx, job.id, {
 progressDone: doneCount + failedCount,
 progressTotal: targets.length,
-message: `并发生成中：已就绪 ${doneCount} / ${targets.length} 镜${gatePending? `，${gatePending} 镜待硬验/硬验中`: ""}${failedCount? `，失败 ${failedCount} 镜`: ""}${quotaCount? `（其中 ${quotaCount} 镜因额度用完失败）`: ""}…`,
+message: `并发生成中：已就绪 ${doneCount} / ${targets.length} 镜${gatePending? `，${gatePending} 镜待验收/验收中`: ""}${failedCount? `，失败 ${failedCount} 镜`: ""}${quotaCount? `（其中 ${quotaCount} 镜因额度用完失败）`: ""}…`,
 });
 if (doneCount + failedCount >= targets.length && inFlight === 0 && toSpawn.length === 0 && gateActive === 0 && gateSpawned === 0) {
+if (failedCount === 0) {
+// 生成完直接拼接成片 (user's flow): when every shot in this batch is
+// ready, chain straight into a stitch job instead of stopping and
+// waiting for a manual step-5 click. The stitch job is driven by the
+// same advanceJob polling as everything else.
+const allShots = await loadShots(ctx, projectId);
+const allReady = allShots.length > 0 && allShots.every((s) => shotReady(s));
+let stitchNote = "";
+if (allReady) {
+const runningStitch = await findActiveJob(ctx, projectId, "stitch");
+if (!runningStitch) {
+const freshProject = await loadProject(ctx, projectId);
+await createJob(
+ctx,
+projectId,
+"stitch",
+{ finalKeyBefore: freshProject?.finalBlobKey ?? "" },
+"全部镜头已生成并通过验收，正在自动拼接成片（保留原声、烧录字幕）…",
+allShots.length,
+);
+stitchNote = "已自动开始拼接成片，去第五步看进度。";
+}
+}
 await patchJob(ctx, job.id, {
 status: "done",
-message:
-failedCount === 0
-? `全部 ${targets.length} 镜视频已生成并通过人物一致性硬验，可以拼接成片。`
-: `批量生成结束：${doneCount} 镜就绪，${failedCount} 镜失败（原因在对应卡片上）${quotaCount? `，其中 ${quotaCount} 镜是额度用完，请等额度恢复后再重试失败镜头`: "，可重试失败镜头"}。`,
+message: `全部 ${targets.length} 镜视频已生成并通过验收。${stitchNote}`,
 });
+} else {
+await patchJob(ctx, job.id, {
+status: "done",
+message: `批量生成结束：${doneCount} 镜就绪，${failedCount} 镜失败（原因在对应卡片上）${quotaCount? `，其中 ${quotaCount} 镜是额度用完，请等额度恢复后再重试失败镜头`: "，可重试失败镜头"}。`,
+});
+}
 }
 return;
 }
@@ -2737,7 +2893,7 @@ const shot = shots.find((s) => s.id === shotId);
 if (!shot) {
 await patchJob(ctx, job.id, { status: "failed", error: "分镜不存在，任务终止。", message: "任务失败"});
 } else if (shotReady(shot)) {
-await patchJob(ctx, job.id, { status: "done", progressDone: 1, progressTotal: 1, message: "视频生成完成，人物一致性硬验已通过"});
+await patchJob(ctx, job.id, { status: "done", progressDone: 1, progressTotal: 1, message: "视频生成完成，已通过验收"});
 } else if (shot.genStatus === "done") {
 // Footage is saved: drive the consistency hard gate (frame check now;
 // automatic regeneration when the check fails). The job completes only
@@ -2745,7 +2901,7 @@ await patchJob(ctx, job.id, { status: "done", progressDone: 1, progressTotal: 1,
 const r = await advanceShotQa(ctx, job, shot);
 if (r === "exhausted") {
 const fresh = (await loadShots(ctx, projectId)).find((s) => s.id === shotId);
-await patchJob(ctx, job.id, { status: "failed", error: fresh?.failReason?? "人物一致性硬验多次未通过。", message: "任务失败"});
+await patchJob(ctx, job.id, { status: "failed", error: fresh?.failReason?? "验收多次未通过。", message: "任务失败"});
 }
 } else if (shot.genStatus === "failed") {
 await patchJob(ctx, job.id, { status: "failed", error: shot.failReason?? "视频生成失败", message: "任务失败"});
@@ -2755,8 +2911,8 @@ await patchJob(ctx, job.id, { status: "failed", error: shot.failReason?? "视频
 // behind instead of regenerating the video.
 try {
 await collectFileToBlob(ctx, detail.sourcePath, `videos/project-${projectId}/shot-${shot.id}-${job.id}.mp4`, "video/mp4");
-await d.update(schema.shots).set({ genStatus: "done", videoBlobKey: `videos/project-${projectId}/shot-${shot.id}-${job.id}.mp4`, failReason: null, quotaExceeded: 0, qaStatus: "pending", qaReason: "", qaModel: "", qaCheckedAt: null, verifyExempt: 0, updatedAt: now()}).where(eq(schema.shots.id, shot.id));
-await patchJob(ctx, job.id, { message: "已自动补收之前生成好的原片，正在抽帧硬验人物一致性…"});
+await d.update(schema.shots).set({ genStatus: "done", videoBlobKey: `videos/project-${projectId}/shot-${shot.id}-${job.id}.mp4`, failReason: null, quotaExceeded: 0, qaStatus: "pending", qaReason: "", qaModel: "", qaCheckedAt: null, verifyExempt: 0, qaApproved: 0, updatedAt: now()}).where(eq(schema.shots.id, shot.id));
+await patchJob(ctx, job.id, { message: "已自动补收之前生成好的原片，正在抽帧验收…"});
 await touchProject(ctx, projectId);
 } catch {
 // Collection failed too; fall through to the stuck-shot handling.
@@ -2780,10 +2936,10 @@ return;
 }
 const r = await advanceShotQa(ctx, job, shot);
 if (r === "ready") {
-await patchJob(ctx, job.id, { status: "done", progressDone: 1, progressTotal: 1, message: `第 ${shot.seq} 镜人物一致性硬验通过。`});
+await patchJob(ctx, job.id, { status: "done", progressDone: 1, progressTotal: 1, message: `第 ${shot.seq} 镜验收通过。`});
 } else if (r === "exhausted") {
 const fresh = (await loadShots(ctx, projectId)).find((s) => s.id === shotId);
-await patchJob(ctx, job.id, { status: "failed", error: fresh?.failReason?? "人物一致性硬验多次未通过。", message: "任务失败"});
+await patchJob(ctx, job.id, { status: "failed", error: fresh?.failReason?? "验收多次未通过。", message: "任务失败"});
 } else if (shot.genStatus === "failed") {
 // A regeneration the gate itself spawned failed in the background.
 await patchJob(ctx, job.id, { status: "failed", error: shot.failReason?? "重新生成失败", message: "任务失败"});
@@ -2832,7 +2988,7 @@ return;
 }
 const gateBlocked = missing.find((s) => qaExhausted(s));
 if (gateBlocked) {
-await patchJob(ctx, job.id, { status: "failed", error: `第 ${gateBlocked.seq} 镜人物一致性硬验多次未通过（${gateBlocked.qaReason.slice(0, 200)}），拼接被门禁拦下。请到画布上重新生成这一镜，硬验通过后再重新拼接。`, message: "任务失败"});
+await patchJob(ctx, job.id, { status: "failed", error: `第 ${gateBlocked.seq} 镜验收多次未通过（${gateBlocked.qaReason.slice(0, 200)}），拼接被拦下。请到画布上重新生成这一镜，或点「人工放行」采用当前成片后再重新拼接。`, message: "任务失败"});
 return;
 }
 const genAttempts = (detail.genAttempts && typeof detail.genAttempts === "object"? detail.genAttempts: {}) as Record<string, number>;
@@ -2848,7 +3004,7 @@ gateActive++;
 continue;
 }
 if (gateActive + gateSpawned < 4) {
-await createJob(ctx, projectId, "verify_shot", { shotId: s.id, parentJobId: job.id}, `正在抽帧硬验第 ${s.seq} 镜的人物一致性…`, 1);
+await createJob(ctx, projectId, "verify_shot", { shotId: s.id, parentJobId: job.id}, `正在抽帧验收第 ${s.seq} 镜…`, 1);
 gateSpawned++;
 }
 continue;
@@ -2875,7 +3031,7 @@ await spawnVideoTask(ctx, projectId, s.id, childId);
 await patchJob(ctx, job.id, {
 progressDone: shotsNow.length - missing.length,
 progressTotal: shotsNow.length,
-message: `正在自动补齐未就绪的镜头（第 ${missing.map((s) => s.seq).join("、")} 镜）：未生成的补生成、已生成的先过人物一致性硬验，全部就绪后自动开始拼接…`,
+message: `正在自动补齐未就绪的镜头（第 ${missing.map((s) => s.seq).join("、")} 镜）：未生成的补生成、已生成的先过验收，全部就绪后自动开始拼接…`,
 ...(genAttemptsChanged? { detail: {...detail, genAttempts} }: {}),
 });
 return;

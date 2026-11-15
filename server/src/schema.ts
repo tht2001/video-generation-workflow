@@ -36,6 +36,12 @@ export const projects = sqliteTable("projects", {
   publishTitle: text("publish_title").notNull().default(""),
   publishCopy: text("publish_copy").notNull().default(""),
   publishConfirmed: integer("publish_confirmed").notNull().default(0),
+  // Acceptance mode for the step-4 frame check: "loose" (default) fails a
+  // shot only for hard story errors (wrong lead actor, key plot action
+  // wrong/missing, a required key character absent the whole shot) and
+  // records everything else as a non-blocking warning; "strict" keeps the
+  // original zero-tolerance per-person anchor matching.
+  qaMode: text("qa_mode").notNull().default("loose"),
   createdAt,
   updatedAt,
 });
@@ -57,9 +63,9 @@ export const shots = sqliteTable("shots", {
   posY: real("pos_y").notNull().default(0),
   // pending | generating | processing | done | failed
   // "done" only means the video file is saved. A shot is READY for
-  // stitching only when it is done AND its frame-sampled consistency
-  // hard-check passed (qa_status = passed). There is no manual
-  // exemption: a failed shot must be regenerated and pass the gate.
+  // stitching only when it is done AND accepted (qa_status = passed) —
+  // acceptance comes from the frame-sampled consistency check (strictness
+  // set by projects.qa_mode) or from a manual approval (qa_approved = 1).
   genStatus: text("gen_status").notNull().default("pending"),
   failReason: text("fail_reason"),
   quotaExceeded: integer("quota_exceeded").notNull().default(0),
@@ -73,8 +79,12 @@ export const shots = sqliteTable("shots", {
   qaCheckedAt: integer("qa_checked_at", { mode: "timestamp_ms" }),
   // Automatic regenerations already spent on QA failures for this shot.
   qaAttempts: integer("qa_attempts").notNull().default(0),
-  // Legacy column, no longer consulted: manual exemption was removed —
-  // readiness depends only on qa_status. Kept at 0 by all writers.
+  // 1 when this shot's "passed" came from the manual 人工放行 action
+  // (approveShot) rather than the frame check; the approval note and
+  // reason live in qa_reason / qa_model. Reset to 0 whenever new footage
+  // is saved or the shot's content/bindings change.
+  qaApproved: integer("qa_approved").notNull().default(0),
+  // Legacy column, no longer consulted. Kept at 0 by all writers.
   verifyExempt: integer("verify_exempt").notNull().default(0),
   createdAt,
   updatedAt,

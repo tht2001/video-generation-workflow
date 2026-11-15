@@ -59,6 +59,18 @@
 - 人工放行已删除（2026-11-14 用户拍板「不通过不让进拼接」）：原「仍然用这一镜」（setShotQaExempt 动作 + shots.verify_exempt）与要求矛盾，已整段移除——shotReady 不再读 verify_exempt，动作与卡片按钮/标注全部删除，失败镜头只能重新生成并通过硬验。DB 列 verify_exempt 保留但恒写 0、不再被读取；存量 verify_exempt=1 的镜头自此按未通过处理（qa_status 未 passed 即未就绪）。
 - 存量镜头：迁移 0003 给 shots 加 qa_* 列，旧视频默认 qa_status=pending，不会被误判为已通过——下次批量/拼接驱动会先对存量成片抽帧复验，不过才重生成。
 
+## 验收放宽（2026-11-14 用户看过《空饭盒》成片后亲口拍板「放宽松一点，过了，生成完直接拼接成片」）
+- 这是用户本人推翻上一节的零容忍铁律，不是我擅自绕过：用户看过被硬验拦下的镜头成片，认为效果可以，要求放行。
+- 验收模式开关（projects.qa_mode，迁移 0004）：第一步项目设置里选「宽松 / 严格」，默认宽松，存量项目迁移后即为宽松。verifyShotConsistency 按模式取词：宽松模式只有三类硬伤判 fail——①做动作的主角认错了人、②关键剧情动作错了或缺了（含关键道具内容不对）、③该镜必需的关键角色全程没出镜；其余（衣服文字、徽章大小形状、背景多出学生、边缘半个人、背景脸模糊看不清、马尾扎位、体型胖瘦、领口颜色等）只进 warnings，随 qa_reason 以「提醒（不影响通过）：…」写回卡片。服务端在宽松模式按 hard issues 重算 verdict，模型把细节误报为 fail 也拦不住。严格模式保持原零容忍逐人比对。硬伤 fail 仍走原自动重生成（上限 2 次）与 exhausted 停车逻辑。
+- 人工放行（approveShot 动作，参数 shotId + 可选 reason）：镜头已有视频即可放行——置 gen_status=done、qa_status=passed、qa_approved=1（迁移 0004 新列）、qa_reason 记「人工放行：<原因>」、qa_model 记「人工放行」。卡片页脚有「人工放行」按钮（带可选原因输入行），代理也可直接调用该动作。shotReady 公式不变（done + 有视频 + qa_status=passed），人工放行天然进拼接；已通过的镜头（含《空饭盒》已过 7 镜）不受影响。新成片收片、内容/绑定编辑、作废重生成都会把 qa_approved 清 0。
+- 生成完直接拼接：gen_all_videos 驱动在全部目标镜头就绪且无失败时，若项目所有镜头都已就绪且没有在跑的拼接任务，自动新建 stitch 任务接力拼接（finalKeyBefore 取当前成片 key），批量任务消息注明已自动开始拼接。
+- verify_shot 派发 bug 已修（jobs 70、71、82、83 的错）：根因是 advanceShotQa 在验收不过、自动重生成时把 spawnVideoTask 挂在当前任务 id 上，当前任务是 verify_shot 时，被派发的 agent 调 jobStep(claim/generated) 被「只认 gen_video」拒绝。修复：重生成一律新建 gen_video 子任务（detail 带 parentJobId）再派发，gen_video / verify_shot 两条驱动路径都走这条新路。
+- 数据不动：迁移 0004 只加列（projects.qa_mode 默认 'loose'、shots.qa_approved 默认 0），《空饭盒》（项目 8）的 12 镜、5 角色、定妆图、已通过 7 镜视频与 1、3 镜最新成片（shot-17-84.mp4、shot-19-85.mp4）全部保留。
+
+## 陈旧额度标记解锁（2026-11-14 用户「只差一镜了」时补）
+- 事故：《空饭盒》第 6 镜（shots.id 22）成片只是硬验不过（名单外人物），却被打上 quotaExceeded=1，startJob(gen_video) 被拒 5 次、gen_all_videos 秒败，标记无任何清除路径、永久锁死；同期第 9、12 镜生成成功，证明额度其实还有。
+- 修复（最小改动）：新增动作 resetShotQuota（参数 shotId）——只清该镜 quota_exceeded=0 并置 fail_reason=null，不动视频、验收状态与其余 11 镜数据；分镜卡在 quotaExceeded 时显示「清除额度标记，允许重试」按钮。清掉后 startJob(gen_video) 恢复接单。
+
 ## Long-term data behavior
 - **Refresh policy**: 无外部数据刷新；页面打开时从 DB 读取项目全量数据，任务运行期间客户端每 4 秒轮询进度，任务完成由 invalidateQueries 触发回填。
 - **Growth**: 用户手动新建项目，项目下脚本、分镜、角色、连续性结论、任务记录、成片随使用累积，互不影响；不预置任何示例/测试项目（遵用户明示）。

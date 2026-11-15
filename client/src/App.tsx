@@ -72,7 +72,7 @@ const KIND_LABEL: Record<string, string> = {
   publish_copy: "整理发布文案",
   gen_video: "生成视频",
   gen_all_videos: "并发生成全部视频",
-  verify_shot: "人物一致性硬验",
+  verify_shot: "抽帧验收",
   stitch: "拼接成片",
 };
 
@@ -638,10 +638,17 @@ function StepSettings({ project, onSaved }: { project: Project; onSaved: () => v
     audience: project.audience,
     platform: project.platform,
     tone: project.tone,
+    qaMode: project.qaMode === "strict" ? "strict" : "loose",
   });
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm((f) => ({ ...f, [k]: e.target.value }));
   const saveMut = useMutation({
-    mutationFn: () => api.updateProjectSettings({ projectId: project.id, ...form, aspect: form.aspect as "9:16" | "16:9" }),
+    mutationFn: () =>
+      api.updateProjectSettings({
+        projectId: project.id,
+        ...form,
+        aspect: form.aspect as "9:16" | "16:9",
+        qaMode: form.qaMode as "loose" | "strict",
+      }),
     onSuccess: () => {
       onSaved();
       void qc.invalidateQueries({ queryKey: ["project"] });
@@ -695,7 +702,17 @@ function StepSettings({ project, onSaved }: { project: Project; onSaved: () => v
           <label className={labelCls} htmlFor="p-tone">整体基调</label>
           <input id="p-tone" className={inputCls} placeholder="例如 爽感逆袭、节奏快" value={form.tone} onChange={set("tone")} />
         </div>
+        <div>
+          <label className={labelCls} htmlFor="p-qamode">验收模式（第四步抽帧验收）</label>
+          <select id="p-qamode" className={inputCls} value={form.qaMode} onChange={set("qaMode")}>
+            <option value="loose">宽松（默认）：只拦三类硬伤</option>
+            <option value="strict">严格：逐人比对定妆锚图</option>
+          </select>
+        </div>
       </div>
+      <p className="text-xs leading-5 text-[var(--dim)]">
+        验收模式决定每镜生成后抽帧验收的松紧：<strong className="text-[var(--text)]">宽松</strong>只在主角认错人、关键剧情动作错了或缺了、必需的关键角色全程没出镜这三类硬伤时判不过，衣服文字、徽章、背景多出人、脸模糊、马尾高低、体型胖瘦等细节只记为卡片提醒、不拦拼接；<strong className="text-[var(--text)]">严格</strong>则逐人（含背景人物）与定妆锚图比对，一处对不上就判不过。两种模式下，每张分镜卡上都可以「人工放行」直接采用当前成片。
+      </p>
       <button type="button" className={`${btnPrimary} w-full`} onClick={() => saveMut.mutate()} disabled={saveMut.isPending}>
         {saveMut.isPending ? "保存中…" : "保存设定"}
       </button>
@@ -825,7 +842,7 @@ function StepStoryboard({
       {!data.project.script.trim() && <p className="text-xs text-[var(--bad)]">脚本还是空的，请先完成第二步。</p>}
       {hasShots && (
         <p className="text-sm text-[var(--dim)]">
-          当前共 <span className="font-mono-num text-[var(--text)]">{data.shots.length}</span> 镜，已生成并通过硬验{" "}
+          当前共 <span className="font-mono-num text-[var(--text)]">{data.shots.length}</span> 镜，已生成并通过验收{" "}
           <span className="font-mono-num text-[var(--text)]">{data.shots.filter((s) => s.ready).length}</span> 镜。在画布上点任意卡片即可生成那一镜。
         </p>
       )}
@@ -961,12 +978,12 @@ function StepStudio({
 
       {/* ---- video generation ---- */}
       <div>
-        <h3 className="text-sm font-semibold">视频生成（真视频）· 人物一致性硬门禁</h3>
+        <h3 className="text-sm font-semibold">视频生成（真视频）· 抽帧验收</h3>
         <p className="mt-1 text-xs leading-5 text-[var(--dim)]">
-          点画布上任意一张分镜卡即可生成那一镜；也可以并发生成全部：一批最多同时 6 条，更多自动拆批。每镜生成时带入本镜全部出场角色的定妆锚图——包括只在背景出现的人物——并把每个人的性别、外貌、发型、服装特征写死在提示词里，名单之外不允许出现任何人物。
+          点画布上任意一张分镜卡即可生成那一镜；也可以并发生成全部：一批最多同时 6 条，更多自动拆批。每镜生成时带入本镜全部出场角色的定妆锚图——包括只在背景出现的人物——并把每个人的性别、外貌、发型、服装特征写死在提示词里。全部生成并通过验收后，会自动接着拼接成片。
         </p>
         <p className="mt-1 text-xs leading-5 text-[var(--dim)]">
-          生成完不是终点：工作流会从成片里抽帧，逐人（含背景里只露半边的人）与定妆锚图硬验。验不过就自动作废、重新生成（最多 2 次）；仍不过会停下来报错，只能在卡片上重新生成、通过硬验后才能继续。<strong className="text-[var(--text)]">没通过硬验的镜头，进不了第五步拼接——没有人工放行。</strong>某一镜长时间卡住没有回写时会自动判定卡住并重新生成；额度用完会明确提示。每镜带声音：台词由人物开口说出做口型同步，旁白为画外音。
+          生成完会从成片里抽帧验收，松紧按第一步的验收模式（当前：<strong className="text-[var(--text)]">{data.project.qaMode === "strict" ? "严格" : "宽松"}</strong>）：宽松模式只拦三类硬伤——做动作的主角认错了人、关键剧情动作错了或缺了、该镜必需的关键角色全程没出镜；衣服上的文字、徽章大小、背景多出学生、边缘半个人、背景人脸模糊、马尾高低、体型胖瘦、领口颜色等细节只记为卡片提醒，不拦通过。严格模式则逐人（含背景里只露半边的人）与定妆锚图比对，一处对不上就判不过。验收不过会自动作废、重新生成（最多 2 次）；仍不过会停下来报错——这时可以在卡片上重新生成，或者看过成片觉得可以就点<strong className="text-[var(--text)]">「人工放行」</strong>直接采用、进拼接。某一镜长时间卡住没有回写时会自动判定卡住并重新生成；额度用完会明确提示。每镜带声音：台词由人物开口说出做口型同步，旁白为画外音。
         </p>
         <button
           type="button"
@@ -974,13 +991,13 @@ function StepStudio({
           disabled={runningKinds.has("gen_all_videos") || pendingShots === 0}
           onClick={() => startJob("gen_all_videos")}
         >
-          {runningKinds.has("gen_all_videos") ? "并发生成中…" : `并发生成全部（${pendingShots} 镜待生成 / 待硬验）`}
+          {runningKinds.has("gen_all_videos") ? "并发生成中…" : `并发生成全部（${pendingShots} 镜待生成 / 待验收）`}
         </button>
         {qaFailedShots.length > 0 && (
           <div className="mt-2 space-y-1.5">
             {qaFailedShots.map((s) => (
               <p key={s.id} className="rounded-lg border border-[var(--bad)] px-2.5 py-1.5 text-xs leading-5 text-[var(--bad)]">
-                第 {s.seq} 镜硬验未通过：{s.qaReason || "人物与定妆锚对不上"}（已自动重生成 {s.qaAttempts}/{s.qaMaxAttempts} 次，去画布卡片上处理）
+                第 {s.seq} 镜验收未通过：{s.qaReason || "与验收标准对不上"}（已自动重生成 {s.qaAttempts}/{s.qaMaxAttempts} 次，去画布卡片上重新生成，或看过成片后点「人工放行」）
               </p>
             ))}
           </div>
@@ -1166,7 +1183,7 @@ function StepStitch({ data, startJob, running }: { data: ProjectData; startJob: 
     <section aria-label="第五步 拼接成片" className="space-y-3">
       <h2 className="font-display text-lg font-semibold">第五步 · 拼接成片</h2>
       <p className="text-xs leading-5 text-[var(--dim)]">
-        把全部已就绪的分镜片段拼成一个完整成片：只保留每一镜原片自带的声音（不会再配一遍旁白），只烧录字幕——白字、黑色描边、无背景底色。短片用尾帧定格加叠化过渡，长片用无损直接拼接。<strong className="text-[var(--text)]">人物一致性硬验没通过的镜头不能拼接，没有例外</strong>：点下面按钮会先把未就绪的镜头补生成、复验或重生成，全部通过硬验后才开始拼接。
+        把全部已就绪的分镜片段拼成一个完整成片：只保留每一镜原片自带的声音（不会再配一遍旁白），只烧录字幕——白字、黑色描边、无背景底色。短片用尾帧定格加叠化过渡，长片用无损直接拼接。<strong className="text-[var(--text)]">没通过验收的镜头不能拼接</strong>（人工放行的算通过）：点下面按钮会先把未就绪的镜头补生成、复验或重生成，全部就绪后才开始拼接。并发生成全部且都通过验收时，会自动接着拼，不用等这一步。
       </p>
       <p className="text-sm text-[var(--dim)]">
         已就绪 <span className="font-mono-num text-[var(--text)]">{done}</span> / <span className="font-mono-num text-[var(--text)]">{total}</span> 镜
@@ -1176,7 +1193,7 @@ function StepStitch({ data, startJob, running }: { data: ProjectData; startJob: 
         <div className="space-y-1.5">
           {qaBlocked.map((s) => (
             <p key={s.id} className="rounded-lg border border-[var(--warn)] px-2.5 py-1.5 text-xs leading-5 text-[var(--warn)]">
-              第 {s.seq} 镜{s.qaStatus === "failed" ? `硬验未通过：${s.qaReason || "人物与定妆锚对不上"}` : "已生成、还没通过人物一致性硬验"}，通过前不能拼接。
+              第 {s.seq} 镜{s.qaStatus === "failed" ? `验收未通过：${s.qaReason || "与验收标准对不上"}` : "已生成、还没通过验收"}，通过前不能拼接（看过成片觉得可以，可在画布卡片上点「人工放行」）。
             </p>
           ))}
         </div>
@@ -1615,11 +1632,33 @@ function ShotCard({
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["project"] }),
     onError: (e) => onNotice({ ok: false, text: e instanceof Error ? e.message : String(e) }),
   });
+  const [approving, setApproving] = useState(false);
+  const [approveReason, setApproveReason] = useState("");
+  const approveMut = useMutation({
+    mutationFn: () => api.approveShot({ shotId: shot.id, reason: approveReason.trim() || undefined }),
+    onSuccess: () => {
+      setApproving(false);
+      setApproveReason("");
+      void qc.invalidateQueries({ queryKey: ["project"] });
+      onNotice({ ok: true, text: `第 ${shot.seq} 镜已人工放行，可以进拼接。` });
+    },
+    onError: (e) => onNotice({ ok: false, text: e instanceof Error ? e.message : String(e) }),
+  });
+  const resetQuotaMut = useMutation({
+    mutationFn: () => api.resetShotQuota({ shotId: shot.id }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["project"] });
+      onNotice({ ok: true, text: `第 ${shot.seq} 镜的额度标记已清除，可以重新生成这一镜了。` });
+    },
+    onError: (e) => onNotice({ ok: false, text: e instanceof Error ? e.message : String(e) }),
+  });
+  const canApprove = Boolean(shot.videoUrl) && !shot.ready;
+  const looseMode = data.project.qaMode !== "strict";
 
   const charNames = data.characters.filter((c) => shot.characterIds.includes(c.id)).map((c) => c.name);
   const statusColor =
-    shot.genStatus === "done" && !shot.ready
-      ? shot.qaStatus === "failed"
+    (shot.genStatus === "done" || (shot.genStatus === "failed" && shot.videoUrl)) && !shot.ready
+      ? shot.qaStatus === "failed" || shot.genStatus === "failed"
         ? "var(--bad)"
         : "var(--warn)"
       : shot.genStatus === "done"
@@ -1630,7 +1669,13 @@ function ShotCard({
             ? "var(--dim)"
             : "var(--warn)";
   const statusLabel =
-    shot.genStatus === "done" && !shot.ready ? (shot.qaStatus === "failed" ? "硬验未过" : "待硬验") : GEN_LABEL[shot.genStatus];
+    shot.genStatus === "done" && !shot.ready
+      ? shot.qaStatus === "failed"
+        ? "验收未过"
+        : "待验收"
+      : shot.genStatus === "failed" && shot.videoUrl && !shot.ready
+        ? "验收未过"
+        : GEN_LABEL[shot.genStatus];
   const busy = shot.genStatus === "generating" || shot.genStatus === "processing";
   const qaColor =
     shot.qaStatus === "passed"
@@ -1638,14 +1683,15 @@ function ShotCard({
       : shot.qaStatus === "failed"
         ? "var(--bad)"
         : "var(--warn)";
-  const qaLabel =
-    shot.qaStatus === "passed"
-      ? "硬验通过"
+  const qaLabel = shot.qaApproved
+    ? "人工放行通过"
+    : shot.qaStatus === "passed"
+      ? "验收通过"
       : shot.qaStatus === "failed"
-        ? "硬验未通过"
+        ? "验收未通过"
         : shot.qaStatus === "checking"
-          ? "抽帧硬验中"
-          : "待硬验";
+          ? "抽帧验收中"
+          : "待验收";
 
   return (
     <article
@@ -1748,10 +1794,10 @@ function ShotCard({
             </details>
           </div>
         )}
-        {shot.genStatus === "done" && (
+        {(shot.genStatus === "done" || (shot.genStatus === "failed" && shot.videoUrl)) && (
           <div className="rounded-lg border px-2 py-1.5" style={{ borderColor: qaColor }}>
             <span className="font-semibold" style={{ color: qaColor }}>
-              人物一致性硬验：{qaLabel}
+              抽帧验收（{looseMode ? "宽松" : "严格"}）：{qaLabel}
             </span>
             {shot.qaStatus === "failed" && shot.qaAttempts > 0 && (
               <span className="text-[var(--dim)]">（已自动重生成 {shot.qaAttempts}/{shot.qaMaxAttempts} 次）</span>
@@ -1759,7 +1805,11 @@ function ShotCard({
             {shot.qaStatus === "failed" && shot.qaReason && <p className="mt-0.5 leading-5 text-[var(--bad)]">{shot.qaReason}</p>}
             {shot.qaStatus === "passed" && shot.qaReason && <p className="mt-0.5 leading-5 text-[var(--dim)]">{shot.qaReason}</p>}
             {!shot.ready && shot.qaStatus !== "failed" && (
-              <p className="mt-0.5 leading-5 text-[var(--dim)]">抽帧逐人比对定妆锚图（含背景人物），通过前不能拼接。</p>
+              <p className="mt-0.5 leading-5 text-[var(--dim)]">
+                {looseMode
+                  ? "宽松验收只拦主角认错人、关键剧情动作错缺、关键角色缺席三类硬伤，其余问题只记提醒；通过前不能拼接，也可以直接人工放行。"
+                  : "抽帧逐人比对定妆锚图（含背景人物），通过前不能拼接，也可以直接人工放行。"}
+              </p>
             )}
           </div>
         )}
@@ -1767,24 +1817,31 @@ function ShotCard({
           <p className="rounded-lg border border-[var(--bad)] px-2 py-1.5 leading-5 text-[var(--bad)]">{shot.failReason}</p>
         )}
         {shot.quotaExceeded && (
-          <p className="text-[11px] leading-5 text-[var(--warn)]">这是额度用完导致的失败，请等额度恢复后再重试，不要反复点击。</p>
+          <div className="space-y-1.5">
+            <p className="text-[11px] leading-5 text-[var(--warn)]">这一镜被记上了「额度用完」标记，重试会被拦下。如果额度其实还有（比如成片只是验收没过、标记是误报），可以先清除标记再重试。</p>
+            <button type="button" className={btnGhost} disabled={resetQuotaMut.isPending} onClick={() => resetQuotaMut.mutate()}>
+              {resetQuotaMut.isPending ? "清除中…" : "清除额度标记，允许重试"}
+            </button>
+          </div>
         )}
       </div>
 
       <footer className="flex flex-wrap gap-1.5 border-t border-[var(--border)] px-3 py-2">
         {shot.ready ? (
-          <span className="rounded-lg bg-[var(--ok)] px-3 py-2 text-sm font-semibold text-[#14161a]">已生成 ✓ 硬验通过</span>
+          <span className="rounded-lg bg-[var(--ok)] px-3 py-2 text-sm font-semibold text-[#14161a]">
+            {shot.qaApproved ? "已生成 ✓ 人工放行" : "已生成 ✓ 验收通过"}
+          </span>
         ) : shot.genStatus === "done" && shot.qaStatus === "failed" ? (
           <button type="button" className={btnPrimary} onClick={() => startJob("gen_video", { shotId: shot.id })}>
-            重新生成并硬验
+            重新生成并验收
           </button>
         ) : shot.genStatus === "done" ? (
           <>
             <button type="button" className={btnPrimary} disabled>
-              {shot.qaStatus === "checking" ? "抽帧硬验中…" : "等待硬验…"}
+              {shot.qaStatus === "checking" ? "抽帧验收中…" : "等待验收…"}
             </button>
             <button type="button" className={btnGhost} onClick={() => startJob("verify_shot", { shotId: shot.id })}>
-              立即硬验
+              立即验收
             </button>
           </>
         ) : shot.genStatus === "failed" ? (
@@ -1804,6 +1861,31 @@ function ShotCard({
           <button type="button" className={btnPrimary} onClick={() => startJob("gen_video", { shotId: shot.id })}>
             生成真视频
           </button>
+        )}
+        {canApprove && !approving && (
+          <button type="button" className={btnGhost} onClick={() => setApproving(true)}>
+            人工放行
+          </button>
+        )}
+        {canApprove && approving && (
+          <div className="w-full space-y-1.5 rounded-lg border border-[var(--border)] bg-[var(--bg)] p-2">
+            <label className={labelCls} htmlFor={`approve-${shot.id}`}>放行原因（可选，会记在卡片上）</label>
+            <input
+              id={`approve-${shot.id}`}
+              className={inputCls}
+              placeholder="例如：看过成片，效果可以"
+              value={approveReason}
+              onChange={(e) => setApproveReason(e.target.value)}
+            />
+            <div className="flex gap-1.5">
+              <button type="button" className={btnPrimary} disabled={approveMut.isPending} onClick={() => approveMut.mutate()}>
+                {approveMut.isPending ? "放行中…" : "确认放行，直接进拼接"}
+              </button>
+              <button type="button" className={btnGhost} onClick={() => setApproving(false)}>
+                取消
+              </button>
+            </div>
+          </div>
         )}
         {editing ? (
           <button type="button" className={btnGhost} onClick={() => saveMut.mutate()} disabled={saveMut.isPending}>
